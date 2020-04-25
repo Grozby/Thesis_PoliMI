@@ -1,13 +1,12 @@
 from __future__ import print_function
 
-import itertools
 import os
 
 import numpy as np
 from PIL import Image
-from keras_preprocessing.image import ImageDataGenerator
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.utils import Sequence
+
+from UNet.data_generators import DataGenerator, DataGeneratorAlbumentations
 
 dirname = os.path.dirname(__file__)
 
@@ -27,7 +26,7 @@ def prepare_dataset(**configuration):
 
     # Then, we iterate over these directories, and we obtain the corresponding
     # image-mask pair for our dataset.
-    x, y, x_test, y_test = (np.empty((0, 256, 512, 1), dtype=np.uint8) for _ in range(4))
+    x, y, x_test, y_test = (np.empty((0, 256, 512, 4), dtype=np.uint8) for _ in range(4))
 
     for directory in directories:
         images = []
@@ -35,14 +34,12 @@ def prepare_dataset(**configuration):
         for (_, _, filenames) in os.walk(path_prediction_images + directory):
             for filename in filenames:
                 if ".png" in filename:
-                    # First, we load the images and immediately normalize them.
-                    image = np.array(Image.open(path_training_images + directory + '/' + filename),
+                    image = np.array(Image.open(path_training_images + directory + '/' + filename).convert("RGBA"),
                                      dtype=np.uint8)
-                    image = image.reshape(image.shape[0], image.shape[1], 1)
-                    mask = 255 - np.array(Image.open(path_prediction_images + directory + '/' + filename),
-                                          dtype=np.uint8)
-                    mask = mask.reshape(mask.shape[0], mask.shape[1], 1)
-
+                    mask = np.array(Image.open(path_prediction_images + directory + '/' + filename).convert("RGBA"),
+                                    dtype=np.uint8)
+                    # We invert the pixels because in our ground truth images black is where the retina is
+                    mask[..., :3] = 255 - mask[..., :3]
                     images.append(image)
                     masks.append(mask)
 
@@ -79,70 +76,46 @@ def prepare_dataset(**configuration):
                              test_size=configuration['val_size_of_test_and_size'],
                              random_state=configuration['seed'])
 
+    print("Obtaining the train generator...")
+    train_generator = DataGeneratorAlbumentations(images=x_train,
+                                                  labels=y_train,
+                                                  batch_size=configuration['batch_size'],
+                                                  length=configuration["steps_per_epoch"],
+                                                  image_shape=(configuration['input_shape_y'],
+                                                               configuration['input_shape_x'],
+                                                               configuration['input_channels'])
+                                                  )
+    print("Obtaining the validation generator...")
+    validation_generator = DataGeneratorAlbumentations(images=x_val, labels=y_val,
+                                                       batch_size=configuration['batch_size'],
+                                                       length=configuration["steps_per_epoch"],
+                                                       image_shape=(configuration['input_shape_y'],
+                                                                    configuration['input_shape_x'],
+                                                                    configuration['input_channels'])
+                                                       )
+    print("Obtaining the test generator...")
+    test_generator = DataGeneratorAlbumentations(images=x_test, labels=y_test,
+                                                 batch_size=configuration['batch_size'],
+                                                 length=None,
+                                                 do_augment=False,
+                                                 image_shape=(configuration['input_shape_y'],
+                                                              configuration['input_shape_x'],
+                                                              configuration['input_channels'])
+                                                 )
+    print("Obtaining the train dataset...")
     x_train = np.array(x_train, dtype=np.float32) / 255
     y_train = np.array(y_train, dtype=np.float32) / 255
+    print("Obtaining the validation dataset...")
     x_val = np.array(x_val, dtype=np.float32) / 255
     y_val = np.array(y_val, dtype=np.float32) / 255
+    print("Obtaining the test dataset...")
     x_test = np.array(x_test, dtype=np.float32) / 255
     y_test = np.array(y_test, dtype=np.float32) / 255
 
-    print("Obtaining the train generator...")
-    # Once we have obtained the dataset division, we create the generators
-    train_generator = get_generator(x=x_train,
-                                    y=y_train,
-                                    batch_size=configuration['batch_size'],
-                                    seed=configuration['seed'])
-    print("Obtaining the validation generator...")
-    validation_generator = get_generator(x=x_val,
-                                         y=y_val,
-                                         batch_size=configuration['batch_size'],
-                                         seed=configuration['seed'],
-                                         data_generation_arguments={})
-    # print("Obtaining the test generator...")
-    # test_generator = get_generator(x=x_test,
-    #                                y=y_test,
-    #                                batch_size=configuration['batch_size'],
-    #                                seed=configuration['seed'],
-    #                                data_generation_arguments={})
-
-    return x_train, y_train, x_val, y_val, x_test, y_test, train_generator, validation_generator  # , test_generator
+    return x_train, y_train, x_val, y_val, x_test, y_test, train_generator, validation_generator, test_generator
 
 
-def get_generator(batch_size,
-                  x,
-                  y,
-                  seed=1,
-                  data_generation_arguments=None):
-    if data_generation_arguments is None:
-        data_generation_arguments = dict(width_shift_range=0.5,
-                                         zoom_range=[0.5, 1],
-                                         horizontal_flip=True,
-                                         fill_mode='reflect')
-    x_data_generator = ImageDataGenerator(**data_generation_arguments)
-    y_data_generator = ImageDataGenerator(**data_generation_arguments, preprocessing_function=last_preprocessing)
-
-    x_augmented = x_data_generator.flow(x, batch_size=batch_size, seed=seed)
-    y_augmented = y_data_generator.flow(y, batch_size=batch_size, seed=seed)
-
-    return zip(x_augmented, y_augmented)
-
-
-def last_preprocessing(image):
-    image[image > 0.2] = 1
-    image[image <= 0.2] = 0
+def augment_mask(image):
+    image[image > 0.2 * 255] = 255
+    image[image <= 0.2 * 255] = 0
     return image
-
-
-class ImageMaskGenerator(Sequence):
-    def __init__(self, x, y, batch_size):
-        self.x, self.y = x, y
-        self.batch_size = batch_size
-
-    def __len__(self):
-        return int(np.ceil(len(self.x) / float(self.batch_size)))
-
-    def __getitem__(self, idx):
-        batch_x = self.x[idx * self.batch_size: (idx + 1) * self.batch_size]
-        batch_y = self.y[idx * self.batch_size: (idx + 1) * self.batch_size]
-
-        return np.array(batch_x), np.array(batch_y)
